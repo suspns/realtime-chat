@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111827">
+  <title>Realtime Chat</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e5e7eb;background:#0b1020}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh}
+    .wrap{max-width:1100px;margin:auto;padding:18px}
+    .brand{font-size:1.25rem;font-weight:800;margin:8px 0 18px}
+    .panel{background:#121a2c;border:1px solid #26334d;border-radius:16px;padding:16px}
+    .auth{max-width:420px;margin:8vh auto}.row{display:flex;gap:10px;align-items:center}
+    input,button{font:inherit;border-radius:10px;padding:11px;border:1px solid #334155}
+    input{background:#0b1222;color:#fff;width:100%;min-width:0}
+    button{background:#4f46e5;color:white;border:0;cursor:pointer;font-weight:650}
+    button.secondary{background:#273449}button:disabled{opacity:.5}
+    .layout{display:grid;grid-template-columns:260px 1fr;gap:14px}
+    .side{min-height:65vh}.list{display:flex;flex-direction:column;gap:7px;margin-top:12px}
+    .user{background:#1b2740;text-align:left;width:100%;overflow-wrap:anywhere}
+    .user.active{outline:2px solid #818cf8}.chat{height:65vh;display:flex;flex-direction:column}
+    #messages{flex:1;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:8px 2px 16px}
+    .msg{max-width:82%;padding:10px 12px;border-radius:13px;background:#263449;overflow-wrap:anywhere}
+    .msg.mine{align-self:flex-end;background:#4338ca}.meta{font-size:.75rem;opacity:.7;margin-bottom:4px}
+    .composer{display:flex;gap:8px}.composer input{flex:1}
+    .muted{color:#9ca3af;font-size:.9rem}.status{min-height:1.3em;color:#fbbf24;font-size:.9rem}
+    .hidden{display:none!important}h2{font-size:1.1rem;margin:0 0 12px}
+    @media(max-width:680px){.wrap{padding:10px}.layout{grid-template-columns:1fr}.side{min-height:auto}.chat{height:58vh}.list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.auth{margin:5vh auto}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">✦ Realtime Chat</div>
+  <div id="status" class="status" role="status"></div>
+  <section id="auth" class="panel auth">
+    <h2 id="authTitle">Welcome back</h2>
+    <div style="display:grid;gap:10px">
+      <input id="username" autocomplete="username" placeholder="Username (3–30 letters, numbers, _)">
+      <input id="password" type="password" autocomplete="current-password" placeholder="Password (at least 6 characters)">
+      <button id="authBtn">Log in</button>
+      <button id="toggleAuth" class="secondary">Create an account</button>
+    </div>
+    <p class="muted">Create an account or log in to start chatting.</p>
+  </section>
+  <section id="main" class="layout hidden">
+    <aside class="panel side">
+      <div class="row" style="justify-content:space-between"><h2>Chats</h2><button id="logout" class="secondary">Log out</button></div>
+      <div class="muted" id="me"></div>
+      <div class="row" style="margin-top:14px"><input id="groupName" placeholder="New group name"><button id="createGroup">Create</button></div>
+      <div class="muted" style="margin-top:8px">Choose users below, then create a group.</div>
+      <div id="people" class="list"></div>
+      <hr style="border-color:#26334d;margin:16px 0">
+      <h2>Groups</h2><div id="groups" class="list"></div>
+    </aside>
+    <section class="panel chat">
+      <h2 id="chatTitle">Choose a person to chat</h2>
+      <div id="messages"></div>
+      <form id="composer" class="composer">
+        <input id="messageInput" maxlength="2000" placeholder="Write a message…" autocomplete="off" disabled>
+        <button id="sendBtn" disabled>Send</button>
+      </form>
+    </section>
+  </section>
+</div>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let token = null, me = null, socket = null, registerMode = false;
+  let active = null, activeType = null, selectedMembers = new Set(), users = [];
+  const setStatus = text => $('status').textContent = text || '';
+  const authHeaders = () => ({'Authorization':'Bearer '+token,'Content-Type':'application/json'});
+  async function api(path, options={}) {
+    const res = await fetch(path, {...options, headers:{...authHeaders(), ...(options.headers||{})}});
+    let data = {}; try { data = await res.json(); } catch {}
+    if (!res.ok) throw new Error(data.error || ('Request failed ('+res.status+')'));
+    return data;
+  }
+  function showApp() {
+    $('auth').classList.add('hidden'); $('main').classList.remove('hidden');
+    $('me').textContent = 'Signed in as @' + me.username;
+    connectSocket(); refreshUsers(); refreshGroups();
+  }
+  function connectSocket() {
+    if (socket) socket.disconnect();
+    socket = io({auth:{token}});
+    socket.on('connect', () => setStatus('Connected'));
+    socket.on('connect_error', () => setStatus('Realtime connection failed. Refresh and log in again.'));
+    socket.on('presence', data => {
+      const u = users.find(x => x.id === data.id);
+      if (u) { u.online = data.online; renderUsers(); }
+    });
+    socket.on('new_message', msg => {
+      if ((activeType === 'dm' && !msg.group &&
+          ((msg.from === me.id && msg.to === active.id) || (msg.from === active.id && msg.to === me.id))) ||
+          (activeType === 'group' && msg.group === active.id)) appendMessage(msg);
+    });
+    socket.on('group_added', refreshGroups);
+  }
+  async function refreshUsers() {
+    try { users = await api('/api/users'); renderUsers(); }
+    catch(e) { setStatus(e.message); }
+  }
+  function renderUsers() {
+    $('people').innerHTML = '';
+    users.forEach(u => {
+      const b = document.createElement('button'); b.className = 'user secondary' + (activeType==='dm'&&active.id===u.id?' active':'');
+      b.textContent = (u.online ? '🟢 ' : '⚪ ') + '@' + u.username;
+      b.onclick = () => { if (selectedMembers.has(u.id)) selectedMembers.delete(u.id); else if (event && event.shiftKey) selectedMembers.add(u.id); openDM(u); };
+      b.oncontextmenu = e => { e.preventDefault(); if(selectedMembers.has(u.id)) selectedMembers.delete(u.id); else selectedMembers.add(u.id); b.style.outline=selectedMembers.has(u.id)?'2px solid #fbbf24':''; setStatus(selectedMembers.size+' group member(s) selected'); };
+      $('people').appendChild(b);
+    });
+  }
+  async function refreshGroups() {
+    try {
+      const groups = await api('/api/groups'); $('groups').innerHTML='';
+      groups.forEach(g => { const b=document.createElement('button'); b.className='user secondary'+(activeType==='group'&&active.id===g.id?' active':''); b.textContent='👥 '+g.name; b.onclick=()=>openGroup(g); $('groups').appendChild(b); });
+    } catch(e) { setStatus(e.message); }
+  }
+  function clearMessages(){ $('messages').innerHTML=''; }
+  function appendMessage(m) {
+    const box=document.createElement('div'); box.className='msg'+(m.from===me.id?' mine':'');
+    const meta=document.createElement('div'); meta.className='meta'; meta.textContent='@'+m.from_name+' · '+new Date(m.time).toLocaleString();
+    box.appendChild(meta);
+    if(m.text){const t=document.createElement('div');t.textContent=m.text;box.appendChild(t);}
+    if(m.image){const img=document.createElement('img');img.src=m.image;img.alt='Shared image';img.style.maxWidth='100%';img.style.borderRadius='8px';box.appendChild(img);}
+    $('messages').appendChild(box); $('messages').scrollTop=$('messages').scrollHeight;
+  }
+  function renderHistory(rows){clearMessages();rows.forEach(appendMessage);}
+  async function openDM(u) {
+    active={id:u.id,name:'@'+u.username}; activeType='dm'; $('chatTitle').textContent=active.name;
+    $('messageInput').disabled=false; $('sendBtn').disabled=false; renderUsers(); refreshGroups();
+    try { renderHistory(await api('/api/messages/'+u.id)); } catch(e){setStatus(e.message);}
+  }
+  async function openGroup(g) {
+    active={id:g.id,name:g.name}; activeType='group'; $('chatTitle').textContent='👥 '+g.name;
+    $('messageInput').disabled=false; $('sendBtn').disabled=false; renderUsers(); refreshGroups();
+    try { renderHistory(await api('/api/groups/'+g.id+'/messages')); } catch(e){setStatus(e.message);}
+  }
+  $('toggleAuth').onclick=()=>{registerMode=!registerMode;$('authTitle').textContent=registerMode?'Create account':'Welcome back';$('authBtn').textContent=registerMode?'Register':'Log in';$('toggleAuth').textContent=registerMode?'I already have an account':'Create an account';};
+  $('authBtn').onclick=async()=>{
+    const username=$('username').value.trim(), password=$('password').value;
+    setStatus(''); $('authBtn').disabled=true;
+    try {
+      const data=await fetch(registerMode?'/api/register':'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
+      const body=await data.json(); if(!data.ok) throw new Error(body.error||'Authentication failed');
+      token=body.token; me=body.user; showApp();
+    } catch(e){setStatus(e.message);} finally{$('authBtn').disabled=false;}
+  };
+  $('logout').onclick=()=>{if(socket)socket.disconnect();token=null;me=null;active=null;activeType=null;$('main').classList.add('hidden');$('auth').classList.remove('hidden');setStatus('Logged out');};
+  $('composer').onsubmit=e=>{
+    e.preventDefault(); const text=$('messageInput').value.trim();
+    if(!text||!active||!socket)return;
+    const payload=activeType==='group'?{group:active.id,text}:{to:active.id,text};
+    socket.emit('send_message',payload); $('messageInput').value='';
+  };
+  $('createGroup').onclick=async()=>{
+    const name=$('groupName').value.trim();
+    if(!name){setStatus('Enter a group name.');return;}
+    if(!selectedMembers.size){setStatus('Right-click users to select group members, then create the group.');return;}
+    try { await api('/api/groups',{method:'POST',body:JSON.stringify({name,members:[...selectedMembers]})}); $('groupName').value='';selectedMembers.clear();setStatus('Group created');refreshGroups(); }
+    catch(e){setStatus(e.message);}
+  };
+})();
+</script>
+</body>
+</html>
